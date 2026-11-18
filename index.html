@@ -19,6 +19,11 @@ textarea{width:100%;height:160px;background:#222;color:#eee;font-family:monospac
 <button id="btnCam">카메라</button><button id="btnSample">샘플 이미지</button>
 <input type="file" id="file" accept="image/*">
 </div>
+<details id="settings"><summary>설정</summary>
+<div>엔진 <select id="selEngine"><option value="google">Google Vision</option><option value="local">로컬(PaddleOCR)</option></select></div>
+<div id="gnote">선택한 블록 이미지만 Google Cloud Vision으로 전송됩니다.</div>
+<div>API 키 <input type="password" id="keyIn" autocomplete="off" placeholder="API 키"><button id="keySave">저장</button> <span id="keyInfo"></span></div>
+</details>
 <div id="status">모델 로딩 중…</div>
 <div id="camctl" style="display:none"><button id="btnShoot" class="big">찍기</button><button id="btnRetake" class="big" style="display:none">다시 찍기</button> <label><input type="checkbox" id="chkLive">실시간 박스(실험)</label></div>
 <div id="stage"><canvas id="src"></canvas><video id="vid" playsinline muted style="display:none"></video><canvas id="ov"></canvas></div>
@@ -75,10 +80,52 @@ const $=id=>document.getElementById(id);
 const src=$('src'), ov=$('ov'), vid=$('vid'), out=$('out'), statusEl=$('status');
 const sctx=src.getContext('2d'), octx=ov.getContext('2d');
 const work=document.createElement('canvas'), wctx=work.getContext('2d');
-// Recognition engine: swap this object for a remote one later
-const engine={ name:'local', recognize: async(canvas)=>{
+// Recognition engines: same shape, recognize(canvas) -> [{text, box, confidence}]
+const localEngine={ name:'local', recognize: async(canvas)=>{
   const r=await svc.recognize(canvas); window.__lastRec=r;
   return r.results||(r.lines||[]).flat(); } };
+const med=a=>{ const x=[...a].sort((p,q)=>p-q); return x.length?x[x.length>>1]:0; };
+const googleEngine={ name:'google', recognize: async(canvas)=>{
+  const key=localStorage.getItem('rvt.visionKey'); if(!key) throw new Error('API 키가 없습니다');
+  let c=canvas, k=1; const L=Math.max(canvas.width,canvas.height);
+  if(L>2048){ k=2048/L; c=document.createElement('canvas'); c.width=Math.round(canvas.width*k); c.height=Math.round(canvas.height*k); c.getContext('2d').drawImage(canvas,0,0,c.width,c.height); }
+  const b64=c.toDataURL('image/jpeg',0.92).split(',')[1];
+  const resp=await fetch('https://vision.googleapis.com/v1/images:annotate?key='+encodeURIComponent(key),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({requests:[{image:{content:b64},features:[{type:'DOCUMENT_TEXT_DETECTION'}],imageContext:{languageHints:['en','ko']}}]})});
+  const j=await resp.json().catch(()=>({}));
+  if(!resp.ok) throw new Error((j.error&&j.error.message)||('HTTP '+resp.status));
+  const r0=(j.responses||[])[0]||{}; if(r0.error) throw new Error(r0.error.message);
+  // Rebuild lines from word geometry (do not trust fullTextAnnotation.text ordering)
+  const words=[];
+  for(const pg of (r0.fullTextAnnotation?.pages||[])) for(const bl of pg.blocks||[]) for(const pa of bl.paragraphs||[]) for(const w of pa.words||[]){
+    const sy=w.symbols||[]; const text=sy.map(x=>x.text).join(''); const vs=(w.boundingBox?.vertices||[]).map(v=>({x:(v.x||0)/k,y:(v.y||0)/k}));
+    if(!vs.length||!text) continue;
+    const x0=Math.min(...vs.map(v=>v.x)),x1=Math.max(...vs.map(v=>v.x)),y0=Math.min(...vs.map(v=>v.y)),y1=Math.max(...vs.map(v=>v.y));
+    const br=sy.length?sy[sy.length-1].property?.detectedBreak?.type:null;
+    words.push({text,x:x0,y:y0,w:x1-x0,h:y1-y0,yc:(y0+y1)/2,conf:w.confidence??0,sp:['SPACE','SURE_SPACE','EOL_SURE_SPACE','LINE_BREAK'].includes(br)});
+  }
+  const mh=med(words.map(w=>w.h)); words.sort((a,b)=>a.yc-b.yc);
+  const rows=[];
+  for(const w of words){ const r=rows[rows.length-1];
+    if(r && Math.abs(w.yc-med(r.map(q=>q.yc)))<=0.5*mh) r.push(w); else rows.push([w]); }
+  const out=[];
+  for(const r of rows){
+    r.sort((a,b)=>a.x-b.x);
+    // gutter: 1-3 digit first word in leftmost 10% with a gap > 1 word-height
+    if(r.length>1 && /^\d{1,3}$/.test(r[0].text) && r[0].x<canvas.width*0.15 && r[1].x-(r[0].x+r[0].w)>0.5*r[0].h) r.shift(); // relaxed from 10%/1.0h: gutter sits ~12% in after crop margin, gap is small
+    if(!r.length) continue;
+    let t=r[0].text;
+    for(let i=1;i<r.length;i++){ const gap=r[i].x-(r[i-1].x+r[i-1].w); t+=(gap>0.25*r[i].h||r[i-1].sp?' ':'')+r[i].text; }
+    const x0=Math.min(...r.map(w=>w.x)),y0=Math.min(...r.map(w=>w.y)),x1=Math.max(...r.map(w=>w.x+w.w)),y1=Math.max(...r.map(w=>w.y+w.h));
+    out.push({text:t,box:{x:x0,y:y0,width:x1-x0,height:y1-y0},confidence:r.reduce((a,w)=>a+w.conf,0)/r.length});
+  }
+  return out; } };
+let engine=localEngine;
+function keyInfo(){ const k=localStorage.getItem('rvt.visionKey'); $('keyInfo').textContent=k?('키 저장됨 (끝 4자리 ****'+k.slice(-4)+')'):'키 없음'; }
+function setEngine(n){ engine=n==='google'?googleEngine:localEngine; $('selEngine').value=n; $('gnote').style.display=n==='google'?'':'none'; }
+$('keySave').onclick=()=>{ const v=$('keyIn').value.trim(); if(v){ localStorage.setItem('rvt.visionKey',v); $('keyIn').value=''; } keyInfo(); };
+$('selEngine').onchange=e=>setEngine(e.target.value);
+keyInfo(); setEngine(localStorage.getItem('rvt.visionKey')?'google':'local');
 let svc=null, mode='none'; // 'live' | 'still' | 'none'
 let stillCv=null, srcW=0, srcH=0, currentBlocks=[], prevBlocks=[], detMs=0, fps=0, lastT=0, busy=false, addedN=0;
 let stream=null;
@@ -189,9 +236,9 @@ async function pump(){
     const {entry,c}=jobs.shift();
     if(!texts.includes(entry)) continue;
     $('thumb').src=c.toDataURL('image/jpeg',0.7);
-    const t0=performance.now();
-    try{ entry.text=assemble(await engine.recognize(c),c.width); $('jobinfo').textContent=`#${entry.id} 인식 ${(performance.now()-t0).toFixed(0)} ms`; }
-    catch(e){ entry.text=`[오류 #${entry.id}: ${e.message}]`; }
+    const t0=performance.now(), eg=engine, lbl=eg.name==='google'?'Google 인식':'인식';
+    try{ entry.text=assemble(await eg.recognize(c),c.width); $('jobinfo').textContent=`#${entry.id} ${lbl} ${(performance.now()-t0).toFixed(0)} ms`; }
+    catch(e){ entry.text=`[실패 #${entry.id}]`; $('jobinfo').textContent=(eg.name==='google'?'Google OCR 실패: ':'인식 실패: ')+e.message; }
     render();
   }
   running=false;
@@ -214,7 +261,7 @@ $('btnCopy').onclick=async()=>{ try{ await navigator.clipboard.writeText(out.val
 $('btnUndo').onclick=()=>{ const t=texts.pop(); if(t){ t.block.added=0; } render(); if(mode==='still') draw(); };
 $('btnClear').onclick=()=>{ texts.length=0; jobs.length=0; currentBlocks.forEach(b=>b.added=0); addedN=0; render(); if(mode==='still') draw(); };
 
-window.__spike={ getBlocks:()=>currentBlocks, tapBlock, shoot, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
+window.__spike={ setEngine, getBlocks:()=>currentBlocks, tapBlock, shoot, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
 try{ svc=new PaddleOcrService(); await svc.initialize(); statusEl.textContent='준비 완료. 카메라 또는 이미지를 선택하세요.'; window.__spikeReady=true; loop(); }
 catch(e){ statusEl.textContent='모델 초기화 실패: '+e.message; }
 </script></body></html>
