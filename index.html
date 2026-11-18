@@ -16,14 +16,17 @@ textarea{width:100%;height:160px;background:#222;color:#eee;font-family:monospac
 #thumb{max-height:80px;vertical-align:middle;background:#333}
 </style></head><body>
 <div>
-<button id="btnCam">카메라</button><button id="btnSample">샘플 이미지</button>
-<input type="file" id="file" accept="image/*">
+<label class="big" id="lblNative" style="display:inline-block;cursor:pointer"><span id="nativeTxt">사진 찍기</span><input type="file" id="native" accept="image/*" capture="environment" hidden></label>
+<div id="hint">모니터에 가까이 대고, 읽을 부분이 화면을 꽉 채우게 찍으세요. 찍기 전에 글자를 탭해 초점을 맞추세요.</div>
+<button id="btnCam">화면 안 카메라(이전 방식)</button><button id="btnSample">샘플 이미지</button>
+<label>갤러리 <input type="file" id="file" accept="image/*"></label>
 </div>
 <details id="settings"><summary>설정</summary>
 <div>엔진 <select id="selEngine"><option value="google">Google Vision</option><option value="local">로컬(PaddleOCR)</option></select></div>
 <div id="gnote">선택한 블록 이미지만 Google Cloud Vision으로 전송됩니다.</div>
 <div>API 키 <input type="password" id="keyIn" autocomplete="off" placeholder="API 키"><button id="keySave">저장</button> <span id="keyInfo"></span></div>
 </details>
+<div id="warn" style="color:#f44;display:none">Google 키가 없어 로컬로 인식합니다. 설정에서 키를 저장하세요.</div>
 <div id="status">모델 로딩 중…</div>
 <div id="camctl" style="display:none"><button id="btnShoot" class="big">찍기</button><button id="btnRetake" class="big" style="display:none">다시 찍기</button> <label><input type="checkbox" id="chkLive">실시간 박스(실험)</label></div>
 <div id="stage"><canvas id="src"></canvas><video id="vid" playsinline muted style="display:none"></video><canvas id="ov"></canvas></div>
@@ -122,13 +125,17 @@ const googleEngine={ name:'google', recognize: async(canvas)=>{
   return out; } };
 let engine=localEngine;
 function keyInfo(){ const k=localStorage.getItem('rvt.visionKey'); $('keyInfo').textContent=k?('키 저장됨 (끝 4자리 ****'+k.slice(-4)+')'):'키 없음'; }
-function setEngine(n){ engine=n==='google'?googleEngine:localEngine; $('selEngine').value=n; $('gnote').style.display=n==='google'?'':'none'; }
-$('keySave').onclick=()=>{ const v=$('keyIn').value.trim(); if(v){ localStorage.setItem('rvt.visionKey',v); $('keyIn').value=''; } keyInfo(); };
+function setEngine(n){ setTimeout(updWarn,0); engine=n==='google'?googleEngine:localEngine; $('selEngine').value=n; $('gnote').style.display=n==='google'?'':'none'; }
+$('keySave').onclick=()=>{ const v=$('keyIn').value.trim(); if(v){ localStorage.setItem('rvt.visionKey',v); $('keyIn').value=''; } keyInfo(); updWarn(); };
 $('selEngine').onchange=e=>setEngine(e.target.value);
-keyInfo(); setEngine(localStorage.getItem('rvt.visionKey')?'google':'local');
+keyInfo(); if(localStorage.getItem('rvt.visionKey')) setEngine('google'); else { setEngine('google'); $('settings').open=true; }
 let svc=null, mode='none'; // 'live' | 'still' | 'none'
 let stillCv=null, srcW=0, srcH=0, currentBlocks=[], prevBlocks=[], detMs=0, fps=0, lastT=0, busy=false, addedN=0;
-let stream=null;
+let stream=null, photoInfo='';
+const effEngine=()=> (engine===googleEngine && !localStorage.getItem('rvt.visionKey')) ? localEngine : engine;
+const engLabel=()=>'엔진: '+(effEngine()===googleEngine?'Google Vision':'로컬');
+function updWarn(){ $('warn').style.display=(engine===googleEngine&&!localStorage.getItem('rvt.visionKey'))?'':'none'; }
+function setStat(extra){ statusEl.textContent=(photoInfo?photoInfo+' · ':'')+extra+' · '+engLabel(); updWarn(); }
 
 function toast(m){ const t=$('toast'); t.textContent=m; t.style.display='block'; clearTimeout(toast.h); toast.h=setTimeout(()=>t.style.display='none',1500); }
 function sizeCanvases(w,h){ srcW=w; srcH=h; src.width=w; src.height=h; ov.width=w; ov.height=h; }
@@ -141,13 +148,14 @@ async function detectStill(cv){
   const t0=performance.now(); const r=await svc.detect(work,{maxSideLength:960}); detMs=performance.now()-t0;
   return groupBlocks(r.boxes||[]).map(b=>({...b,added:0,src:{x:b.x/sc,y:b.y/sc,width:b.width/sc,height:b.height/sc}}));
 }
-async function freeze(el,w,h){
+async function freeze(el,w,h,info){
+  photoInfo=info||'';
   if(!svc) return;
   busy=true; // pause live loop
   const c=document.createElement('canvas'); c.width=w; c.height=h; c.getContext('2d').drawImage(el,0,0,w,h);
   stillCv=c; mode='still'; sizeCanvases(w,h); sctx.drawImage(c,0,0);
   statusEl.textContent='검출 중…';
-  try{ currentBlocks=await detectStill(c); statusEl.textContent=`검출 ${detMs.toFixed(0)} ms · 블록 ${currentBlocks.length}개`; }
+  try{ currentBlocks=await detectStill(c); setStat(`검출 ${detMs.toFixed(0)} ms · 블록 ${currentBlocks.length}개`); }
   catch(e){ currentBlocks=[]; statusEl.textContent='검출 오류: '+e.message; }
   draw(); busy=false;
   if(stream){ $('btnShoot').style.display='none'; $('btnRetake').style.display=''; }
@@ -158,10 +166,21 @@ function shoot(){
 }
 function retake(){ mode='live'; currentBlocks=[]; prevBlocks=[]; octx.clearRect(0,0,ov.width,ov.height);
   $('btnShoot').style.display=''; $('btnRetake').style.display='none'; statusEl.textContent='카메라 미리보기. 글자를 맞추고 [찍기]를 누르세요.'; }
+// Native camera / file: decode with EXIF orientation, cap long side at 4000
+async function loadFile(file){
+  stopCam(); mode='none'; $('nativeTxt').textContent='다시 찍기';
+  let bm;
+  try{ bm=await createImageBitmap(file,{imageOrientation:'from-image'}); }
+  catch(e){ bm=await new Promise((ok,no)=>{ const im=new Image(); im.onload=()=>ok(im); im.onerror=()=>no(new Error('이미지 디코딩 실패')); im.src=URL.createObjectURL(file); }); }
+  const W=bm.width||bm.naturalWidth, H=bm.height||bm.naturalHeight, k=Math.min(1,4000/Math.max(W,H));
+  const w=Math.round(W*k), h=Math.round(H*k);
+  await freeze(bm,w,h,'사진 '+w+'×'+h);
+}
+$('native').onchange=e=>{ const f=e.target.files[0]; if(f) loadFile(f).catch(er=>statusEl.textContent='사진 오류: '+er.message); e.target.value=''; };
 $('btnShoot').onclick=shoot; $('btnRetake').onclick=retake;
 
 $('btnSample').onclick=()=>loadImage('sample.jpg');
-$('file').onchange=e=>{ const f=e.target.files[0]; if(f) loadImage(URL.createObjectURL(f)); };
+$('file').onchange=e=>{ const f=e.target.files[0]; if(f) loadFile(f).catch(er=>statusEl.textContent='사진 오류: '+er.message); e.target.value=''; };
 function loadImage(url){
   stopCam(); mode='none';
   const im=new Image(); im.onload=()=>freeze(im,im.naturalWidth,im.naturalHeight);
@@ -236,7 +255,7 @@ async function pump(){
     const {entry,c}=jobs.shift();
     if(!texts.includes(entry)) continue;
     $('thumb').src=c.toDataURL('image/jpeg',0.7);
-    const t0=performance.now(), eg=engine, lbl=eg.name==='google'?'Google 인식':'인식';
+    const t0=performance.now(), eg=effEngine(), lbl=eg.name==='google'?'Google 인식':'로컬 인식';
     try{ entry.text=assemble(await eg.recognize(c),c.width); $('jobinfo').textContent=`#${entry.id} ${lbl} ${(performance.now()-t0).toFixed(0)} ms`; }
     catch(e){ entry.text=`[실패 #${entry.id}]`; $('jobinfo').textContent=(eg.name==='google'?'Google OCR 실패: ':'인식 실패: ')+e.message; }
     render();
@@ -261,7 +280,7 @@ $('btnCopy').onclick=async()=>{ try{ await navigator.clipboard.writeText(out.val
 $('btnUndo').onclick=()=>{ const t=texts.pop(); if(t){ t.block.added=0; } render(); if(mode==='still') draw(); };
 $('btnClear').onclick=()=>{ texts.length=0; jobs.length=0; currentBlocks.forEach(b=>b.added=0); addedN=0; render(); if(mode==='still') draw(); };
 
-window.__spike={ setEngine, getBlocks:()=>currentBlocks, tapBlock, shoot, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
+window.__spike={ setEngine, loadFile, getBlocks:()=>currentBlocks, tapBlock, shoot, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
 try{ svc=new PaddleOcrService(); await svc.initialize(); statusEl.textContent='준비 완료. 카메라 또는 이미지를 선택하세요.'; window.__spikeReady=true; loop(); }
 catch(e){ statusEl.textContent='모델 초기화 실패: '+e.message; }
 </script></body></html>
