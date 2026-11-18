@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OCR 스파이크</title>
+<script type="importmap">{"imports":{"onnxruntime-web":"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/ort.all.bundle.min.mjs","ppu-ocv/web":"https://cdn.jsdelivr.net/npm/ppu-ocv@3.3.0/index.web.js","ppu-ocv/canvas-web":"https://cdn.jsdelivr.net/npm/ppu-ocv@3.3.0/index.canvas-web.js"}}</script>
+<style>
+body{font-family:sans-serif;margin:8px;background:#111;color:#eee}
+button,input{margin:2px;padding:8px}
+#stage{position:relative;display:inline-block;max-width:100%;line-height:0;background:#000}
+#src,#ov{max-width:100%;max-height:60vh}
+#ov{position:absolute;left:0;top:0;width:100%;height:100%;cursor:pointer}
+#src{display:block}
+textarea{width:100%;height:160px;background:#222;color:#eee;font-family:monospace}
+#thumb{max-height:80px;vertical-align:middle;background:#333}
+</style></head><body>
+<div>
+<button id="btnCam">카메라</button><button id="btnSample">샘플 이미지</button>
+<input type="file" id="file" accept="image/*">
+</div>
+<div id="status">모델 로딩 중…</div>
+<div id="stage"><canvas id="src"></canvas><video id="vid" playsinline muted style="display:none"></video><canvas id="ov"></canvas></div>
+<div><img id="thumb" alt=""> <span id="jobinfo"></span></div>
+<div><button id="btnCopy">전체 복사</button><button id="btnUndo">마지막 취소</button><button id="btnClear">초기화</button></div>
+<textarea id="out" placeholder="인식 결과가 여기에 쌓입니다"></textarea>
+<script type="module">
+import { PaddleOcrService } from "https://cdn.jsdelivr.net/npm/ppu-paddle-ocr@6.7.1/web/index.js";
+
+// ===== Paragraph grouping (pure function) =====
+function median(a){ if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); return s[s.length>>1]; }
+function groupBlocks(boxes){
+  const n=boxes.length; if(!n) return [];
+  const p=[...Array(n).keys()];
+  const find=i=>{ while(p[i]!==i){ p[i]=p[p[i]]; i=p[i]; } return i; };
+  const medH=median(boxes.map(b=>b.height));
+  for(let i=0;i<n;i++) for(let j=i+1;j<n;j++){
+    const a=boxes[i], b=boxes[j];
+    const gap=Math.max(0, Math.max(a.y,b.y)-Math.min(a.y+a.height,b.y+b.height));
+    if(gap>0.8*Math.min(a.height,b.height)) continue;
+    const overlap=Math.min(a.x+a.width,b.x+b.width)-Math.max(a.x,b.x)>0;
+    if(!(overlap || Math.abs(a.x-b.x)<=2*medH)) continue;
+    p[find(i)]=find(j);
+  }
+  const g=new Map();
+  boxes.forEach((b,i)=>{ const r=find(i); if(!g.has(r)) g.set(r,[]); g.get(r).push(b); });
+  let blocks=[...g.values()].map(m=>{
+    const x0=Math.min(...m.map(b=>b.x)), y0=Math.min(...m.map(b=>b.y));
+    const x1=Math.max(...m.map(b=>b.x+b.width)), y1=Math.max(...m.map(b=>b.y+b.height));
+    return {x:x0,y:y0,width:x1-x0,height:y1-y0,count:m.length};
+  });
+  const medA=median(blocks.map(b=>b.width*b.height));
+  return blocks.filter(b=>b.width*b.height>=0.2*medA);
+}
+// ===== Tracker: IoU match with previous frame + smoothing =====
+function iou(a,b){
+  const w=Math.min(a.x+a.width,b.x+b.width)-Math.max(a.x,b.x), h=Math.min(a.y+a.height,b.y+b.height)-Math.max(a.y,b.y);
+  if(w<=0||h<=0) return 0; const i=w*h; return i/(a.width*a.height+b.width*b.height-i);
+}
+function track(prev,cur,f=0.5){
+  const used=new Set();
+  return cur.map(c=>{
+    let best=-1,bi=0;
+    prev.forEach((p,i)=>{ if(used.has(i)) return; const v=iou(p,c); if(v>bi){bi=v;best=i;} });
+    if(best>=0 && bi>0.5){ used.add(best); const p=prev[best];
+      const s=k=>p[k]*(1-f)+c[k]*f; return {...c,x:s('x'),y:s('y'),width:s('width'),height:s('height')}; }
+    return c;
+  });
+}
+
+// ===== App =====
+const $=id=>document.getElementById(id);
+const src=$('src'), ov=$('ov'), vid=$('vid'), out=$('out'), statusEl=$('status');
+const sctx=src.getContext('2d'), octx=ov.getContext('2d');
+const work=document.createElement('canvas'), wctx=work.getContext('2d');
+let mode='none', img=null, svc=null, busy=false;
+let currentBlocks=[], detMs=0, fps=0, lastT=0;
+let srcW=0, srcH=0;
+
+function srcSize(){ return mode==='video'?[vid.videoWidth,vid.videoHeight]:mode==='image'?[img.naturalWidth,img.naturalHeight]:[0,0]; }
+function srcEl(){ return mode==='video'?vid:img; }
+function setSource(){
+  [srcW,srcH]=srcSize();
+  src.width=srcW; src.height=srcH; ov.width=srcW; ov.height=srcH; // overlay shares source pixel space; CSS scales both identically
+  sctx.drawImage(srcEl(),0,0);
+}
+$('btnSample').onclick=()=>loadImage('sample.jpg');
+$('file').onchange=e=>{ const f=e.target.files[0]; if(f) loadImage(URL.createObjectURL(f)); };
+function loadImage(url){
+  stopCam();
+  const im=new Image(); im.onload=()=>{ img=im; mode='image'; setSource(); currentBlocks=[]; prevBlocks=[]; };
+  im.onerror=()=>statusEl.textContent='이미지를 불러오지 못했습니다.';
+  im.src=url;
+}
+let stream=null;
+function stopCam(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } }
+$('btnCam').onclick=async()=>{
+  try{
+    if(!navigator.mediaDevices?.getUserMedia) throw new Error('이 브라우저는 카메라를 지원하지 않습니다 (HTTPS 필요)');
+    stopCam();
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080}},audio:false});
+    vid.srcObject=stream; await vid.play(); mode='video'; setSource(); prevBlocks=[];
+  }catch(e){ statusEl.textContent='카메라 오류: '+(e.message||e.name)+' (권한을 확인하세요)'; }
+};
+
+let prevBlocks=[];
+async function loop(){
+  requestAnimationFrame(loop);
+  if(!svc||busy||mode==='none') return;
+  busy=true;
+  try{
+    if(mode==='video'){ if(vid.videoWidth!==srcW||vid.videoHeight!==srcH) setSource(); sctx.drawImage(vid,0,0); }
+    if(!srcW){ busy=false; return; }
+    const sc=1280/srcW; work.width=1280; work.height=Math.round(srcH*sc);
+    wctx.drawImage(srcEl(),0,0,work.width,work.height);
+    const t0=performance.now();
+    const r=await svc.detect(work,{maxSideLength:640});
+    detMs=performance.now()-t0;
+    const raw=groupBlocks(r.boxes||[]);
+    const tr=track(prevBlocks,raw,0.5); prevBlocks=tr;
+    currentBlocks=tr.map(b=>({...b,
+      src:{x:b.x/sc,y:b.y/sc,width:b.width/sc,height:b.height/sc}}));
+    const now=performance.now(); if(lastT) fps=fps?fps*0.7+0.3*1000/(now-lastT):1000/(now-lastT); lastT=now;
+    draw();
+    statusEl.textContent=`검출 ${detMs.toFixed(0)} ms · ${fps.toFixed(1)} fps · 블록 ${currentBlocks.length}개`;
+  }catch(e){ statusEl.textContent='검출 오류: '+e.message; }
+  busy=false;
+}
+function draw(){
+  octx.clearRect(0,0,ov.width,ov.height);
+  octx.lineWidth=Math.max(2,srcW/400); octx.strokeStyle='#0f0'; octx.fillStyle='rgba(0,255,0,0.12)';
+  octx.font=`${Math.max(14,srcW/60)}px sans-serif`;
+  currentBlocks.forEach((b,i)=>{ const s=b.src; octx.fillRect(s.x,s.y,s.width,s.height); octx.strokeRect(s.x,s.y,s.width,s.height);
+    octx.fillStyle='#0f0'; octx.fillText(String(i),s.x+4,s.y+Math.max(14,srcW/60)); octx.fillStyle='rgba(0,255,0,0.12)'; });
+}
+// CSS px -> source px mapping (canvas displayed without object-fit, so a plain scale)
+ov.addEventListener('click',e=>{
+  const r=ov.getBoundingClientRect(); const px=(e.clientX-r.left)*srcW/r.width, py=(e.clientY-r.top)*srcH/r.height;
+  let hit=-1,ha=Infinity;
+  currentBlocks.forEach((b,i)=>{ const s=b.src; if(px>=s.x&&px<=s.x+s.width&&py>=s.y&&py<=s.y+s.height&&s.width*s.height<ha){ha=s.width*s.height;hit=i;} });
+  if(hit>=0) tapBlock(hit);
+});
+
+// ===== Job queue =====
+let jobN=0; const jobs=[]; let running=false; const texts=[]; // texts: {id, ph, text}
+function render(){ out.value=texts.map(t=>t.text??t.ph).join('\n'); }
+function tapBlock(i){
+  const b=currentBlocks[i]; if(!b) return;
+  const s=b.src, mx=s.width*0.12, my=s.height*0.12;
+  const x=Math.max(0,s.x-mx), y=Math.max(0,s.y-my);
+  const w=Math.min(srcW,s.x+s.width+mx)-x, h=Math.min(srcH,s.y+s.height+my)-y;
+  // crop from the FULL-res source frame
+  const c=document.createElement('canvas'); c.width=Math.round(w); c.height=Math.round(h);
+  c.getContext('2d').drawImage(srcEl(),x,y,w,h,0,0,c.width,c.height);
+  const id=++jobN; const entry={id,ph:`[인식 중 #${id}]`,text:null};
+  texts.push(entry); render(); jobs.push({entry,c}); pump();
+}
+async function pump(){
+  if(running) return; running=true;
+  while(jobs.length){
+    const {entry,c}=jobs.shift();
+    if(!texts.includes(entry)) continue; // cancelled
+    $('thumb').src=c.toDataURL('image/jpeg',0.7);
+    const t0=performance.now();
+    try{
+      const r=await svc.recognize(c);
+      window.__lastRec=r; entry.text=assemble(r.results||(r.lines||[]).flat(),c.width);
+      $('jobinfo').textContent=`#${entry.id} 인식 ${(performance.now()-t0).toFixed(0)} ms`;
+    }catch(e){ entry.text=`[오류 #${entry.id}: ${e.message}]`; }
+    render();
+  }
+  running=false;
+}
+function assemble(res,cw){
+  // box coords may live in a resized space, so measure the 8% zone against the detected text extent instead of crop width
+  const L=Math.min(...res.map(r=>r.box.x)), R=Math.max(...res.map(r=>r.box.x+r.box.width));
+  const items=res.filter(r=>!(/^\d{1,3}$/.test(r.text.trim()) && r.box.x+r.box.width/2<L+(R-L)*0.08+r.box.width));
+  items.sort((a,b)=>(a.box.y+a.box.height/2)-(b.box.y+b.box.height/2));
+  const rows=[];
+  for(const it of items){
+    const cy=it.box.y+it.box.height/2, row=rows[rows.length-1];
+    if(row && Math.abs(cy-row.cy)<=it.box.height/2){ row.items.push(it); row.cy=(row.cy*(row.items.length-1)+cy)/row.items.length; }
+    else rows.push({cy,items:[it]});
+  }
+  return rows.map(r=>r.items.sort((a,b)=>a.box.x-b.box.x).map(i=>i.text).join(' ')).join('\n');
+}
+$('btnCopy').onclick=async()=>{ try{ await navigator.clipboard.writeText(out.value); statusEl.textContent='복사했습니다.'; }catch(e){ statusEl.textContent='복사 실패: '+e.message; } };
+$('btnUndo').onclick=()=>{ texts.pop(); render(); };
+$('btnClear').onclick=()=>{ texts.length=0; jobs.length=0; render(); };
+
+window.__spike={ getBlocks:()=>currentBlocks, tapBlock, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
+try{ svc=new PaddleOcrService(); await svc.initialize(); statusEl.textContent='준비 완료. 이미지를 선택하세요.'; window.__spikeReady=true; loop(); }
+catch(e){ statusEl.textContent='모델 초기화 실패: '+e.message; }
+</script></body></html>
