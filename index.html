@@ -5,9 +5,11 @@
 <script type="importmap">{"imports":{"onnxruntime-web":"https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/ort.all.bundle.min.mjs","ppu-ocv/web":"https://cdn.jsdelivr.net/npm/ppu-ocv@3.3.0/index.web.js","ppu-ocv/canvas-web":"https://cdn.jsdelivr.net/npm/ppu-ocv@3.3.0/index.canvas-web.js"}}</script>
 <style>
 body{font-family:sans-serif;margin:8px;background:#111;color:#eee}
-button,input{margin:2px;padding:8px}
+button,input{margin:2px;padding:12px;font-size:16px}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:8px;display:none}
+.big{font-size:20px;padding:16px 28px;background:#2a7;color:#fff;border:0;border-radius:8px}
 #stage{position:relative;display:inline-block;max-width:100%;line-height:0;background:#000}
-#src,#ov{max-width:100%;max-height:60vh}
+#src{max-width:100%;max-height:60vh;width:auto;height:auto}
 #ov{position:absolute;left:0;top:0;width:100%;height:100%;cursor:pointer}
 #src{display:block}
 textarea{width:100%;height:160px;background:#222;color:#eee;font-family:monospace}
@@ -18,7 +20,9 @@ textarea{width:100%;height:160px;background:#222;color:#eee;font-family:monospac
 <input type="file" id="file" accept="image/*">
 </div>
 <div id="status">모델 로딩 중…</div>
+<div id="camctl" style="display:none"><button id="btnShoot" class="big">찍기</button><button id="btnRetake" class="big" style="display:none">다시 찍기</button> <label><input type="checkbox" id="chkLive">실시간 박스(실험)</label></div>
 <div id="stage"><canvas id="src"></canvas><video id="vid" playsinline muted style="display:none"></video><canvas id="ov"></canvas></div>
+<div id="toast"></div>
 <div><img id="thumb" alt=""> <span id="jobinfo"></span></div>
 <div><button id="btnCopy">전체 복사</button><button id="btnUndo">마지막 취소</button><button id="btnClear">초기화</button></div>
 <textarea id="out" placeholder="인식 결과가 여기에 쌓입니다"></textarea>
@@ -71,68 +75,93 @@ const $=id=>document.getElementById(id);
 const src=$('src'), ov=$('ov'), vid=$('vid'), out=$('out'), statusEl=$('status');
 const sctx=src.getContext('2d'), octx=ov.getContext('2d');
 const work=document.createElement('canvas'), wctx=work.getContext('2d');
-let mode='none', img=null, svc=null, busy=false;
-let currentBlocks=[], detMs=0, fps=0, lastT=0;
-let srcW=0, srcH=0;
+// Recognition engine: swap this object for a remote one later
+const engine={ name:'local', recognize: async(canvas)=>{
+  const r=await svc.recognize(canvas); window.__lastRec=r;
+  return r.results||(r.lines||[]).flat(); } };
+let svc=null, mode='none'; // 'live' | 'still' | 'none'
+let stillCv=null, srcW=0, srcH=0, currentBlocks=[], prevBlocks=[], detMs=0, fps=0, lastT=0, busy=false, addedN=0;
+let stream=null;
 
-function srcSize(){ return mode==='video'?[vid.videoWidth,vid.videoHeight]:mode==='image'?[img.naturalWidth,img.naturalHeight]:[0,0]; }
-function srcEl(){ return mode==='video'?vid:img; }
-function setSource(){
-  [srcW,srcH]=srcSize();
-  src.width=srcW; src.height=srcH; ov.width=srcW; ov.height=srcH; // overlay shares source pixel space; CSS scales both identically
-  sctx.drawImage(srcEl(),0,0);
+function toast(m){ const t=$('toast'); t.textContent=m; t.style.display='block'; clearTimeout(toast.h); toast.h=setTimeout(()=>t.style.display='none',1500); }
+function sizeCanvases(w,h){ srcW=w; srcH=h; src.width=w; src.height=h; ov.width=w; ov.height=h; }
+function stopCam(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } $('camctl').style.display='none'; }
+
+// Detect once on a full-res canvas: scale to <=1600px wide, maxSideLength 960
+async function detectStill(cv){
+  const sc=Math.min(1,1600/cv.width); work.width=Math.round(cv.width*sc); work.height=Math.round(cv.height*sc);
+  wctx.drawImage(cv,0,0,work.width,work.height);
+  const t0=performance.now(); const r=await svc.detect(work,{maxSideLength:960}); detMs=performance.now()-t0;
+  return groupBlocks(r.boxes||[]).map(b=>({...b,added:0,src:{x:b.x/sc,y:b.y/sc,width:b.width/sc,height:b.height/sc}}));
 }
+async function freeze(el,w,h){
+  if(!svc) return;
+  busy=true; // pause live loop
+  const c=document.createElement('canvas'); c.width=w; c.height=h; c.getContext('2d').drawImage(el,0,0,w,h);
+  stillCv=c; mode='still'; sizeCanvases(w,h); sctx.drawImage(c,0,0);
+  statusEl.textContent='검출 중…';
+  try{ currentBlocks=await detectStill(c); statusEl.textContent=`검출 ${detMs.toFixed(0)} ms · 블록 ${currentBlocks.length}개`; }
+  catch(e){ currentBlocks=[]; statusEl.textContent='검출 오류: '+e.message; }
+  draw(); busy=false;
+  if(stream){ $('btnShoot').style.display='none'; $('btnRetake').style.display=''; }
+}
+function shoot(){
+  if(mode==='live' && vid.videoWidth) return freeze(vid,vid.videoWidth,vid.videoHeight);
+  if(mode==='still' && stillCv) return freeze(stillCv,stillCv.width,stillCv.height); // re-run on the current still
+}
+function retake(){ mode='live'; currentBlocks=[]; prevBlocks=[]; octx.clearRect(0,0,ov.width,ov.height);
+  $('btnShoot').style.display=''; $('btnRetake').style.display='none'; statusEl.textContent='카메라 미리보기. 글자를 맞추고 [찍기]를 누르세요.'; }
+$('btnShoot').onclick=shoot; $('btnRetake').onclick=retake;
+
 $('btnSample').onclick=()=>loadImage('sample.jpg');
 $('file').onchange=e=>{ const f=e.target.files[0]; if(f) loadImage(URL.createObjectURL(f)); };
 function loadImage(url){
-  stopCam();
-  const im=new Image(); im.onload=()=>{ img=im; mode='image'; setSource(); currentBlocks=[]; prevBlocks=[]; };
+  stopCam(); mode='none';
+  const im=new Image(); im.onload=()=>freeze(im,im.naturalWidth,im.naturalHeight);
   im.onerror=()=>statusEl.textContent='이미지를 불러오지 못했습니다.';
   im.src=url;
 }
-let stream=null;
-function stopCam(){ if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; } }
 $('btnCam').onclick=async()=>{
   try{
     if(!navigator.mediaDevices?.getUserMedia) throw new Error('이 브라우저는 카메라를 지원하지 않습니다 (HTTPS 필요)');
     stopCam();
     stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080}},audio:false});
-    vid.srcObject=stream; await vid.play(); mode='video'; setSource(); prevBlocks=[];
+    vid.srcObject=stream; await vid.play(); $('camctl').style.display='';
+    sizeCanvases(vid.videoWidth,vid.videoHeight); retake();
   }catch(e){ statusEl.textContent='카메라 오류: '+(e.message||e.name)+' (권한을 확인하세요)'; }
 };
 
-let prevBlocks=[];
+// Preview loop (+ optional experimental live boxes)
 async function loop(){
   requestAnimationFrame(loop);
-  if(!svc||busy||mode==='none') return;
+  if(mode!=='live'||!vid.videoWidth) return;
+  if(vid.videoWidth!==srcW||vid.videoHeight!==srcH) sizeCanvases(vid.videoWidth,vid.videoHeight);
+  sctx.drawImage(vid,0,0);
+  if(!$('chkLive').checked||busy||!svc) { if(!$('chkLive').checked) octx.clearRect(0,0,ov.width,ov.height); return; }
   busy=true;
   try{
-    if(mode==='video'){ if(vid.videoWidth!==srcW||vid.videoHeight!==srcH) setSource(); sctx.drawImage(vid,0,0); }
-    if(!srcW){ busy=false; return; }
-    const sc=1280/srcW; work.width=1280; work.height=Math.round(srcH*sc);
-    wctx.drawImage(srcEl(),0,0,work.width,work.height);
-    const t0=performance.now();
-    const r=await svc.detect(work,{maxSideLength:640});
-    detMs=performance.now()-t0;
-    const raw=groupBlocks(r.boxes||[]);
-    const tr=track(prevBlocks,raw,0.5); prevBlocks=tr;
-    currentBlocks=tr.map(b=>({...b,
-      src:{x:b.x/sc,y:b.y/sc,width:b.width/sc,height:b.height/sc}}));
-    const now=performance.now(); if(lastT) fps=fps?fps*0.7+0.3*1000/(now-lastT):1000/(now-lastT); lastT=now;
-    draw();
-    statusEl.textContent=`검출 ${detMs.toFixed(0)} ms · ${fps.toFixed(1)} fps · 블록 ${currentBlocks.length}개`;
+    const sc=1280/srcW; work.width=1280; work.height=Math.round(srcH*sc); wctx.drawImage(vid,0,0,work.width,work.height);
+    const t0=performance.now(); const r=await svc.detect(work,{maxSideLength:640}); detMs=performance.now()-t0;
+    prevBlocks=track(prevBlocks,groupBlocks(r.boxes||[]),0.5);
+    if(mode==='live'){ currentBlocks=prevBlocks.map(b=>({...b,added:0,src:{x:b.x/sc,y:b.y/sc,width:b.width/sc,height:b.height/sc}}));
+      const now=performance.now(); if(lastT) fps=fps?fps*0.7+0.3*1000/(now-lastT):1000/(now-lastT); lastT=now; draw();
+      statusEl.textContent=`검출 ${detMs.toFixed(0)} ms · ${fps.toFixed(1)} fps · 블록 ${currentBlocks.length}개`; }
   }catch(e){ statusEl.textContent='검출 오류: '+e.message; }
   busy=false;
 }
 function draw(){
   octx.clearRect(0,0,ov.width,ov.height);
-  octx.lineWidth=Math.max(2,srcW/400); octx.strokeStyle='#0f0'; octx.fillStyle='rgba(0,255,0,0.12)';
-  octx.font=`${Math.max(14,srcW/60)}px sans-serif`;
-  currentBlocks.forEach((b,i)=>{ const s=b.src; octx.fillRect(s.x,s.y,s.width,s.height); octx.strokeRect(s.x,s.y,s.width,s.height);
-    octx.fillStyle='#0f0'; octx.fillText(String(i),s.x+4,s.y+Math.max(14,srcW/60)); octx.fillStyle='rgba(0,255,0,0.12)'; });
+  const fs=Math.max(14,srcW/40);
+  octx.lineWidth=Math.max(2,srcW/400); octx.font=`bold ${fs}px sans-serif`;
+  currentBlocks.forEach(b=>{ const s=b.src;
+    octx.strokeStyle=b.added?'#fa0':'#0f0'; octx.fillStyle=b.added?'rgba(255,170,0,0.35)':'rgba(0,255,0,0.10)';
+    octx.fillRect(s.x,s.y,s.width,s.height); octx.strokeRect(s.x,s.y,s.width,s.height);
+    if(b.added){ octx.fillStyle='#fff'; octx.strokeStyle='#000'; octx.lineWidth=4; octx.strokeText(String(b.added),s.x+6,s.y+fs); octx.fillText(String(b.added),s.x+6,s.y+fs); octx.lineWidth=Math.max(2,srcW/400); }
+  });
 }
-// CSS px -> source px mapping (canvas displayed without object-fit, so a plain scale)
+// Canvases are displayed with a plain CSS scale, so CSS px -> source px is a ratio
 ov.addEventListener('click',e=>{
+  if(mode!=='still') return;
   const r=ov.getBoundingClientRect(); const px=(e.clientX-r.left)*srcW/r.width, py=(e.clientY-r.top)*srcH/r.height;
   let hit=-1,ha=Infinity;
   currentBlocks.forEach((b,i)=>{ const s=b.src; if(px>=s.x&&px<=s.x+s.width&&py>=s.y&&py<=s.y+s.height&&s.width*s.height<ha){ha=s.width*s.height;hit=i;} });
@@ -140,37 +169,36 @@ ov.addEventListener('click',e=>{
 });
 
 // ===== Job queue =====
-let jobN=0; const jobs=[]; let running=false; const texts=[]; // texts: {id, ph, text}
+let jobN=0; const jobs=[]; let running=false; const texts=[];
 function render(){ out.value=texts.map(t=>t.text??t.ph).join('\n'); }
 function tapBlock(i){
-  const b=currentBlocks[i]; if(!b) return;
+  const b=currentBlocks[i]; if(!b||mode!=='still') return;
+  if(b.added){ toast('이미 추가됨'); return; }
+  b.added=++addedN; draw();
   const s=b.src, mx=s.width*0.12, my=s.height*0.12;
   const x=Math.max(0,s.x-mx), y=Math.max(0,s.y-my);
   const w=Math.min(srcW,s.x+s.width+mx)-x, h=Math.min(srcH,s.y+s.height+my)-y;
-  // crop from the FULL-res source frame
   const c=document.createElement('canvas'); c.width=Math.round(w); c.height=Math.round(h);
-  c.getContext('2d').drawImage(srcEl(),x,y,w,h,0,0,c.width,c.height);
-  const id=++jobN; const entry={id,ph:`[인식 중 #${id}]`,text:null};
+  c.getContext('2d').drawImage(stillCv,x,y,w,h,0,0,c.width,c.height); // crop from full-res still
+  const id=++jobN; const entry={id,ph:`[인식 중 #${id}]`,text:null,block:b};
   texts.push(entry); render(); jobs.push({entry,c}); pump();
 }
 async function pump(){
   if(running) return; running=true;
   while(jobs.length){
     const {entry,c}=jobs.shift();
-    if(!texts.includes(entry)) continue; // cancelled
+    if(!texts.includes(entry)) continue;
     $('thumb').src=c.toDataURL('image/jpeg',0.7);
     const t0=performance.now();
-    try{
-      const r=await svc.recognize(c);
-      window.__lastRec=r; entry.text=assemble(r.results||(r.lines||[]).flat(),c.width);
-      $('jobinfo').textContent=`#${entry.id} 인식 ${(performance.now()-t0).toFixed(0)} ms`;
-    }catch(e){ entry.text=`[오류 #${entry.id}: ${e.message}]`; }
+    try{ entry.text=assemble(await engine.recognize(c),c.width); $('jobinfo').textContent=`#${entry.id} 인식 ${(performance.now()-t0).toFixed(0)} ms`; }
+    catch(e){ entry.text=`[오류 #${entry.id}: ${e.message}]`; }
     render();
   }
   running=false;
 }
 function assemble(res,cw){
-  // box coords may live in a resized space, so measure the 8% zone against the detected text extent instead of crop width
+  if(!res.length) return '';
+  // box coords may be in a resized space, so use detected text extent for the 8% zone
   const L=Math.min(...res.map(r=>r.box.x)), R=Math.max(...res.map(r=>r.box.x+r.box.width));
   const items=res.filter(r=>!(/^\d{1,3}$/.test(r.text.trim()) && r.box.x+r.box.width/2<L+(R-L)*0.08+r.box.width));
   items.sort((a,b)=>(a.box.y+a.box.height/2)-(b.box.y+b.box.height/2));
@@ -182,11 +210,11 @@ function assemble(res,cw){
   }
   return rows.map(r=>r.items.sort((a,b)=>a.box.x-b.box.x).map(i=>i.text).join(' ')).join('\n');
 }
-$('btnCopy').onclick=async()=>{ try{ await navigator.clipboard.writeText(out.value); statusEl.textContent='복사했습니다.'; }catch(e){ statusEl.textContent='복사 실패: '+e.message; } };
-$('btnUndo').onclick=()=>{ texts.pop(); render(); };
-$('btnClear').onclick=()=>{ texts.length=0; jobs.length=0; render(); };
+$('btnCopy').onclick=async()=>{ try{ await navigator.clipboard.writeText(out.value); toast('복사했습니다.'); }catch(e){ toast('복사 실패: '+e.message); } };
+$('btnUndo').onclick=()=>{ const t=texts.pop(); if(t){ t.block.added=0; } render(); if(mode==='still') draw(); };
+$('btnClear').onclick=()=>{ texts.length=0; jobs.length=0; currentBlocks.forEach(b=>b.added=0); addedN=0; render(); if(mode==='still') draw(); };
 
-window.__spike={ getBlocks:()=>currentBlocks, tapBlock, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
-try{ svc=new PaddleOcrService(); await svc.initialize(); statusEl.textContent='준비 완료. 이미지를 선택하세요.'; window.__spikeReady=true; loop(); }
+window.__spike={ getBlocks:()=>currentBlocks, tapBlock, shoot, getText:()=>out.value, stats:()=>({detMs,fps,blocks:currentBlocks.length}) };
+try{ svc=new PaddleOcrService(); await svc.initialize(); statusEl.textContent='준비 완료. 카메라 또는 이미지를 선택하세요.'; window.__spikeReady=true; loop(); }
 catch(e){ statusEl.textContent='모델 초기화 실패: '+e.message; }
 </script></body></html>
